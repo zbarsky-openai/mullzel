@@ -1,0 +1,22 @@
+module(name = "mullzel")
+
+local_sdk = use_repo_rule("//bazel:repos.bzl", "local_sdk")
+
+local_sdk(
+    name = "pinned_mull",
+    env = "MULLZEL_MULL_SDK",
+    entries = ["mull-ir-frontend-19", "mull-runner-19", "lib"],
+    build = """
+exports_files(["mull-ir-frontend-19", "mull-runner-19", "lib/libclang-cpp.so.19.1"], visibility = ["//visibility:public"])
+filegroup(name = "libraries", srcs = glob(["lib/**"]), visibility = ["//visibility:public"])
+""",
+)
+
+bazel_dep(name = "rules_rs", version = "0.2.4")
+bazel_dep(name = "llvm", version = "0.8.25")
+rust = use_extension("@rules_rs//rs/toolchains:module_extension.bzl", "toolchains")
+rust.toolchain(edition = "2021", version = "1.85.1", use_rust_redist = False)
+use_repo(rust, "default_rust_toolchains")
+rules_rust = use_extension("@rules_rs//rs:rules_rust.bzl", "rules_rust")
+use_repo(rules_rust, "rules_rust")
+register_toolchains("@default_rust_toolchains//...")

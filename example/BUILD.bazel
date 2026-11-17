@@ -1,0 +1,29 @@
+load("//bazel:mull.bzl", "mull_control_test", "mull_rust_harness")
+
+mull_rust_harness(
+    name = "instrumented_harness",
+    srcs = ["src/lib.rs"],
+    edition = "2021",
+    crate_root = "src/lib.rs",
+    config = "mull.yml",
+)
+
+mull_control_test(
+    name = "strong",
+    size = "small",
+    harness = ":instrumented_harness",
+    config = "mull.yml",
+    expected = "killed",
+    expected_location = "example/src/lib.rs:3:5",
+    test_filter = "tests::strong",
+)
+
+mull_control_test(
+    name = "weak",
+    size = "small",
+    harness = ":instrumented_harness",
+    config = "mull.yml",
+    expected = "survived",
+    expected_location = "example/src/lib.rs:3:5",
+    test_filter = "tests::weak",
+)
