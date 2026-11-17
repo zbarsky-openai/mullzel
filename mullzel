@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""Build and mutation-test one Cargo test harness with the Mull LLVM plugin."""
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+def existing_file(value):
+    path = Path(value).expanduser().resolve()
+    if not path.is_file():
+        raise argparse.ArgumentTypeError(f"not a file: {value}")
+    return str(path)
+
+
+def executable(value):
+    path = shutil.which(os.path.expanduser(value))
+    if not path:
+        raise argparse.ArgumentTypeError(f"not executable or not on PATH: {value}")
+    return os.path.abspath(path)
+
+
+def options(argv):
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     epilog="After --, pass arguments to the Rust test harness.")
+    parser.add_argument("--plugin", type=existing_file, required=True,
+                        help="Mull IR plugin matching rustc's LLVM version")
+    parser.add_argument("--runner", type=executable, required=True,
+                        help="mull-runner executable, by path or PATH name")
+    parser.add_argument("--toolchain", required=True,
+                        help="installed rustup toolchain (pin the Rust version)")
+    parser.add_argument("--config", type=existing_file, required=True,
+                        help="Mull YAML config; passed via MULL_CONFIG")
+    parser.add_argument("--manifest-path", type=existing_file)
+    parser.add_argument("-p", "--package", help="Cargo package selector")
+    target = parser.add_mutually_exclusive_group()
+    target.add_argument("--lib", action="store_true", help="library unit tests (default)")
+    target.add_argument("--test", metavar="NAME", help="named integration test")
+    parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--locked", action="store_true")
+    parser.add_argument("--bootstrap", action="store_true",
+                        help="opt in to RUSTC_BOOTSTRAP=1 for a stable rustc")
+    parser.add_argument("--runner-arg", action="append", default=[], metavar="ARG",
+                        help="repeat as --runner-arg=ARG to pass options to Mull")
+    if "--" in argv:
+        separator = argv.index("--")
+        flags, test_args = argv[:separator], argv[separator + 1:]
+    else:
+        flags, test_args = argv, []
+    return parser.parse_args(flags), test_args
+
+
+def announce(command):
+    print("+ " + shlex.join(command), file=sys.stderr, flush=True)
+
+
+def cargo_harness(command, env, test_name):
+    announce(command)
+    artifacts = set()
+    with subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
+                          text=True, errors="replace") as proc:
+        for line in proc.stdout:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                sys.stderr.write(line)
+                continue
+            if not isinstance(record, dict):
+                continue
+            if record.get("reason") == "compiler-message":
+                rendered = record.get("message", {}).get("rendered")
+                if rendered:
+                    sys.stderr.write(rendered)
+            if (record.get("reason") != "compiler-artifact"
+                    or not record.get("executable")
+                    or not record.get("profile", {}).get("test")):
+                continue
+            target = record.get("target", {})
+            kinds = target.get("kind", [])
+            if test_name is not None:
+                matches = "test" in kinds and target.get("name") == test_name
+            else:
+                matches = any(k in kinds for k in ("lib", "rlib", "proc-macro", "dylib", "cdylib", "staticlib"))
+            if matches:
+                artifacts.add((record["executable"], record.get("manifest_path")))
+        status = proc.wait()
+    if status:
+        raise subprocess.CalledProcessError(status, command)
+    if len(artifacts) != 1:
+        paths = ", ".join(sorted(path for path, _ in artifacts))
+        raise ValueError(f"expected one Cargo test executable, found {len(artifacts)}"
+                         + (f": {paths}" if paths else ""))
+    path, manifest = next(iter(artifacts))
+    if not manifest:
+        raise ValueError("Cargo did not report a manifest path for the harness")
+    return str(Path(path).resolve()), str(Path(manifest).resolve().parent)
+
+
+def main(argv):
+    args, test_args = options(argv)
+    env = os.environ.copy()
+    env["MULL_CONFIG"] = args.config
+    build_env = env.copy()
+    if args.bootstrap:
+        build_env["RUSTC_BOOTSTRAP"] = "1"
+    cargo = ["cargo", "+" + args.toolchain, "rustc"]
+    if args.manifest_path:
+        cargo += ["--manifest-path", args.manifest_path]
+    if args.package:
+        cargo += ["--package", args.package]
+    if args.offline:
+        cargo += ["--offline"]
+    if args.locked:
+        cargo += ["--locked"]
+    cargo += ["--test", args.test] if args.test else ["--lib"]
+    # Cargo does not track in-place changes to plugin/config. Build fresh.
+    with tempfile.TemporaryDirectory(prefix="mullzel-") as directory:
+        cargo += ["--target-dir", directory, "--profile", "test", "--message-format=json",
+                  "--", "-Zllvm-plugins=" + args.plugin, "-Coverflow-checks=off",
+                  "-Cdebuginfo=2", "-Copt-level=0", "-Ccodegen-units=1"]
+        harness, cwd = cargo_harness(cargo, build_env, args.test)
+        baseline = [harness, *test_args]
+        announce(baseline)
+        result = subprocess.run(baseline, env=env, cwd=cwd, stdout=subprocess.PIPE,
+                                text=True, errors="replace")
+        print(result.stdout, end="", flush=True)
+        if result.returncode:
+            return result.returncode
+        if not re.search(r"(?m)^test result: ok\. [1-9][0-9]* passed;", result.stdout):
+            raise ValueError("baseline did not report any passing tests in libtest's default format")
+        command = [args.runner, *args.runner_arg, "--", harness, *test_args]
+        announce(command)
+        return subprocess.call(command, env=env, cwd=cwd)
+
+
+if __name__ == "__main__":
+    try:
+        result = main(sys.argv[1:])
+    except subprocess.CalledProcessError as error:
+        result = error.returncode
+    except (OSError, ValueError) as error:
+        print(f"mullzel: {error}", file=sys.stderr)
+        result = 1
+    except KeyboardInterrupt:
+        result = 130
+    sys.exit(result if result >= 0 else 128 - result)
